@@ -1,0 +1,34 @@
+START BOT
+
+1. INITIALIZE DISCORD CLIENT
+   - Load environment variables (Discord token, channel ID)
+   - Set up client and UI button for manual signal checks
+
+2. DEFINE TICKERS
+   - SPY, QQQ, TSLA, AAPL, AMZN, etc.
+
+3. ON BOT READY:
+   - Announce online status in Discord
+   - Attach interactive "Run Signal Check" button
+
+4. SIGNAL CHECK WORKFLOW (auto and manual trigger)
+   FOR each ticker IN tickers:
+       FETCH 15-minute candle data (1-day history) using yfinance
+       CALCULATE:
+           - Strat candle types (1, 2, 3) using OHLC logic
+           - Reversal or continuation patterns (e.g., 2-1-2, 3-1-2)
+       IF valid Strat pattern is detected:
+           IDENTIFY signal type (e.g., bullish reversal)
+           FETCH nearest option strike and expiry using yfinance
+           CONSTRUCT Discord message:
+               - Ticker, current price, strat type
+               - Option idea: strike, type, expiration
+           SEND message to Discord channel
+
+5. SCHEDULER
+   - Every 10 minutes, run the signal check function automatically
+
+6. ERROR HANDLING
+   - Log issues with data fetch, option lookup, or Discord send
+
+END BOT
