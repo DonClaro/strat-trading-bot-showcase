@@ -1,34 +1,127 @@
-START BOT
+BEGIN
 
-1. INITIALIZE DISCORD CLIENT
-   - Load environment variables (Discord token, channel ID)
-   - Set up client and UI button for manual signal checks
+IMPORT runtime libs (os, datetime, asyncio, pytz)
+IMPORT data libs (pandas, yfinance)
+IMPORT plotting libs (matplotlib headless, mplfinance)
+IMPORT discord client & UI components
+IMPORT scheduler (APScheduler)
+IMPORT keep_alive web ping server
 
-2. DEFINE TICKERS
-   - SPY, QQQ, TSLA, AAPL, AMZN, etc.
+CONFIG:
+  DISCORD_TOKEN      ← from env
+  DISCORD_CHANNEL_ID ← from env
+  ROLE_ID            ← mention role for alerts
+  TICKERS            ← list of symbols to scan (SPY, QQQ, ...)
 
-3. ON BOT READY:
-   - Announce online status in Discord
-   - Attach interactive "Run Signal Check" button
+INIT:
+  create Discord client with minimal intents
+  create AsyncIOScheduler instance (for timed scans)
+  set matplotlib backend to "Agg" (server-safe)
 
-4. SIGNAL CHECK WORKFLOW (auto and manual trigger)
-   FOR each ticker IN tickers:
-       FETCH 15-minute candle data (1-day history) using yfinance
-       CALCULATE:
-           - Strat candle types (1, 2, 3) using OHLC logic
-           - Reversal or continuation patterns (e.g., 2-1-2, 3-1-2)
-       IF valid Strat pattern is detected:
-           IDENTIFY signal type (e.g., bullish reversal)
-           FETCH nearest option strike and expiry using yfinance
-           CONSTRUCT Discord message:
-               - Ticker, current price, strat type
-               - Option idea: strike, type, expiration
-           SEND message to Discord channel
+FUNCTION is_market_open():
+  now_et ← current US/Eastern time
+  IF now_et is Saturday or Sunday → RETURN False
+  market_open  ← 09:30 ET today
+  market_close ← 16:00 ET today
+  RETURN market_open ≤ now_et ≤ market_close
 
-5. SCHEDULER
-   - Every 10 minutes, run the signal check function automatically
+CLASS SignalCheckView (discord.ui.View):
+  button "Run Signal Check":
+    on click:
+      reply ephemeral "Checking signals…"
+      AWAIT run_all_signals()
 
-6. ERROR HANDLING
-   - Log issues with data fetch, option lookup, or Discord send
+FUNCTION classify_strat_candle(curr, prev):
+  inside  ← (curr.high ≤ prev.high) AND (curr.low ≥ prev.low)
+  outside ← (curr.high ≥ prev.high) AND (curr.low ≤ prev.low)
+  IF outside AND NOT inside → RETURN "3"
+  IF inside  AND NOT outside → RETURN "1"
+  ELSE
+    IF curr.close > curr.open → RETURN "2u"
+    ELSE                     → RETURN "2d"
 
-END BOT
+FUNCTION detect_strat(df):
+  CLEAN df (drop MultiIndex, ensure columns)
+  IF length(df) < 4 → RETURN (None, None)
+  s3 ← classify_strat_candle(df[-3], df[-4])
+  s2 ← classify_strat_candle(df[-2], df[-3])
+  s1 ← classify_strat_candle(df[-1], df[-2])
+  sequence ← [s3, s2, s1]
+
+  IF sequence == [3, 1, 2u] → pattern ← "3-1-2 Bullish"
+  IF sequence == [3, 1, 2d] → pattern ← "3-1-2 Bearish"
+  IF sequence in ([2u,1,2u], [2d,1,2u]) → "2-1-2 Bullish"
+  IF sequence in ([2u,1,2d], [2d,1,2d]) → "2-1-2 Bearish"
+  IF sequence == [1, 2u, 2u] → "1-2-2 Bullish"
+  IF sequence == [1, 2d, 2d] → "1-2-2 Bearish"
+  ELSE IF (s3 in {2u,2d} AND s2 == 1):
+        s1 == 2u → "2-1-2 Bullish"
+        s1 == 2d → "2-1-2 Bearish"
+
+  RETURN (pattern, sequence)  // pattern may be None
+
+FUNCTION render_strat_chart_png(symbol, df, pattern, detected_sequence=None):
+  dff ← last ~26 bars of df
+  ensure dff has columns: Open, High, Low, Close, Volume (floats)
+  create mplfinance candlestick figure (with volume)
+  highlight last 3 bars using translucent spans
+  compute STRAT label for each candle:
+    if detected_sequence present → use for last 3 bars
+    else → compute labels for all
+  draw labels (1, 2u, 2d, 3) above candles
+  save PNG to /tmp/<symbol>_strat.png
+  RETURN file path (or None on error)
+
+ASYNC FUNCTION select_option_contract(symbol, last_price, pattern):
+  tk ← yfinance.Ticker(symbol)
+  expiries ← tk.options
+  IF empty → RETURN (None, None, None)
+  expiry ← nearest expiry
+  direction ← "Call" if "Bullish" in pattern else "Put"
+  df_opt ← calls OR puts from option_chain(expiry)
+  filter df_opt to strikes within [0.5×price, 1.5×price]
+  pick strike closest to last_price
+  RETURN (strike, expiry, direction) OR (fallbacks on error)
+
+ASYNC FUNCTION compute_strat_signal(symbol):
+  df ← yfinance.download(symbol, period="5d", interval="15m")
+  IF df too short → RETURN (None, None, None, None)
+  (pattern, sequence) ← detect_strat(df)
+  IF pattern exists:
+     last_price ← df[-1].Close
+     RETURN (pattern, last_price, df, sequence)
+  ELSE:
+     RETURN (None, None, df, None)
+
+ASYNC FUNCTION run_all_signals():
+  IF NOT is_market_open() → log "closed" and RETURN
+  FOR each sym in TICKERS:
+    TRY:
+      (pattern, price, df, sequence) ← AWAIT compute_strat_signal(sym)
+      IF pattern:
+        (strike, expiry, opt_type) ← AWAIT select_option_contract(sym, price, pattern)
+        IF any None → set sensible fallbacks (ATM-ish strike, "Next Friday", Call/Put by direction)
+        msg ← formatted Discord text:
+              emoji by direction + pattern + symbol + price + timeframe + option idea + @role
+        channel ← client.get_channel(DISCORD_CHANNEL_ID)
+        IF channel exists:
+           img ← render_strat_chart_png(sym, df, pattern, sequence)
+           IF img exists:
+             send msg with image file
+           ELSE:
+             send msg without image
+    EXCEPT log errors and continue
+  log "Auto-check complete"
+
+DISCORD EVENT on_ready():
+  log bot identity
+  send "Bot is online + button" to channel with SignalCheckView()
+  scheduler.start()
+  scheduler.add_job(run_all_signals, every 15 minutes)
+  log "scheduler started"
+
+MAIN:
+  keep_alive()   // tiny Flask server for uptime pings (if needed)
+  client.run(DISCORD_TOKEN)
+
+END
