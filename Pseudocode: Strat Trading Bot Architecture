@@ -1,127 +1,445 @@
-BEGIN
+PSEUDOCODE: Discord STRAT Scanner + Options + Learning System
 
-IMPORT runtime libs (os, datetime, asyncio, pytz)
-IMPORT data libs (pandas, yfinance)
-IMPORT plotting libs (matplotlib headless, mplfinance)
-IMPORT discord client & UI components
-IMPORT scheduler (APScheduler)
-IMPORT keep_alive web ping server
+IMPORT libraries for:
+  - OS/env vars, JSON, time/date, asyncio
+  - market data (yfinance), indicators (pandas_ta), charting (mplfinance/matplotlib)
+  - Discord bot + UI buttons
+  - scheduling (AsyncIOScheduler) + timezone (pytz)
+  - options pricing/greeks (py_vollib)
+  - custom modules: database, technical_filters, fibonacci_filters, ticker_config
+  - US holidays library
 
-CONFIG:
-  DISCORD_TOKEN      ← from env
-  DISCORD_CHANNEL_ID ← from env
-  ROLE_ID            ← mention role for alerts
-  TICKERS            ← list of symbols to scan (SPY, QQQ, ...)
+----------------------------
+CONFIG / GLOBALS
+----------------------------
+READ DISCORD_TOKEN from environment
+READ DISCORD_CHANNEL_ID from environment
+SET TICKERS list
+SET ROLE_ID to ping on alerts
 
-INIT:
-  create Discord client with minimal intents
-  create AsyncIOScheduler instance (for timed scans)
-  set matplotlib backend to "Agg" (server-safe)
+FUNCTION load_suppressed_patterns():
+  TRY open suppressed_patterns.json
+    PARSE JSON
+    suppressed_patterns = set(json["suppressed"])
+    adaptive_enabled = json["adaptive_enabled"]
+    RETURN suppressed_patterns, adaptive_enabled
+  IF file missing:
+    RETURN empty set, False
+  IF error:
+    RETURN empty set, False
 
+FUNCTION load_fib_config():
+  fib_config = fibonacci_filters.load_fib_config()
+  IF fib_config exists:
+    RETURN fib_config
+  ELSE:
+    RETURN empty dict
+
+SUPPRESSED_PATTERNS, ADAPTIVE_SUPPRESSION_ENABLED = load_suppressed_patterns()
+FIB_CONFIG = load_fib_config()
+
+INITIALIZE Discord client with intents (guilds + message content)
+INITIALIZE scheduler using US/Eastern timezone
+
+----------------------------
+MARKET / TIME HELPERS
+----------------------------
 FUNCTION is_market_open():
-  now_et ← current US/Eastern time
-  IF now_et is Saturday or Sunday → RETURN False
-  market_open  ← 09:30 ET today
-  market_close ← 16:00 ET today
-  RETURN market_open ≤ now_et ≤ market_close
+  now_et = current datetime in US/Eastern
+  holidays = US market holidays for current year
 
-CLASS SignalCheckView (discord.ui.View):
-  button "Run Signal Check":
-    on click:
-      reply ephemeral "Checking signals…"
-      AWAIT run_all_signals()
+  IF today is holiday OR weekend:
+    RETURN False
 
+  DEFINE half-day dates:
+    - day after Thanksgiving
+    - Christmas Eve
+
+  market_open_time = 9:30 ET
+  market_close_time = 1:00 ET if half-day else 4:00 ET
+
+  RETURN (market_open_time <= now_et <= market_close_time)
+
+FUNCTION get_market_hour():
+  now_et = current datetime in US/Eastern
+  RETURN "HH:MM"
+
+DEFINE SECTOR_MAP for tickers -> sector category
+
+----------------------------
+DATA HELPERS / FILTER SIGNALS
+----------------------------
+ASYNC FUNCTION get_average_volume(symbol):
+  DOWNLOAD 1 month daily data in a background thread
+  IF volume exists:
+    RETURN avg(volume)
+  ELSE:
+    RETURN None
+
+ASYNC FUNCTION detect_volume_spike(df, symbol):
+  IF df invalid OR < 5 rows:
+    RETURN (None, None)
+
+  current_volume = last candle volume
+  avg_15m_volume = mean(volume of previous up-to-20 candles)
+
+  IF avg_15m_volume <= 0:
+    RETURN (None, None)
+
+  ratio = current_volume / avg_15m_volume
+
+  IF ratio >= 3.0: RETURN ("EXTREME", ratio)
+  ELSE IF ratio >= 2.0: RETURN ("HIGH", ratio)
+  ELSE IF ratio >= 1.5: RETURN ("ELEVATED", ratio)
+  ELSE: RETURN ("NORMAL", ratio)
+
+ASYNC FUNCTION check_multi_timeframe(symbol, pattern):
+  bullish = ("Bullish" in pattern)
+
+  DOWNLOAD 5 days of 1-hour data in a background thread
+  IF insufficient data:
+    RETURN (None, None)
+
+  ema20 = EMA20 of 1H close
+  current_price = last 1H close
+  above_ema = (current_price > ema20)
+
+  IF bullish AND above_ema:
+    RETURN ("CONFIRMED", "Above 1H EMA20")
+  IF bearish AND below_ema:
+    RETURN ("CONFIRMED", "Below 1H EMA20")
+  ELSE:
+    RETURN ("COUNTER", "Against 1H trend")
+
+ASYNC FUNCTION check_earnings_proximity(symbol):
+  GET ticker calendar from yfinance in a background thread
+  IF no earnings date found:
+    RETURN (False, None)
+
+  FOR each earnings_date:
+    days_until = earnings_date - today
+    IF 0 <= days_until <= 3:
+      RETURN (True, days_until)
+
+  RETURN (False, None)
+
+ASYNC FUNCTION check_sector_correlation(symbol, pattern):
+  sector = SECTOR_MAP[symbol] default "OTHER"
+  bullish = ("Bullish" in pattern)
+
+  IF symbol is INDEX:
+    RETURN (None, None)
+
+  reference = SPY unless sector is TECH -> QQQ
+
+  DOWNLOAD reference 1 day of 15m data in a background thread
+  IF insufficient data:
+    RETURN (None, None)
+
+  ref_change_pct = % change from first open to last close
+  ref_bullish = ref_change_pct > +0.1
+  ref_bearish = ref_change_pct < -0.1
+
+  IF bullish AND ref_bullish: RETURN ("ALIGNED",   "reference +X%")
+  IF bearish AND ref_bearish: RETURN ("ALIGNED",   "reference -X%")
+  IF bullish AND ref_bearish: RETURN ("DIVERGENT", "reference -X%")
+  IF bearish AND ref_bullish: RETURN ("DIVERGENT", "reference +X%")
+  ELSE: RETURN ("NEUTRAL", "reference flat")
+
+ASYNC FUNCTION calculate_iv_percentile(symbol, current_iv):
+  GET option expirations in background thread
+  IF not enough expirations:
+    RETURN 50
+
+  FOR first N expirations:
+    GET option chain
+    COLLECT implied vol values from calls and puts
+
+  IF enough IV samples:
+    percentile = count(iv < current_iv) / total * 100
+    RETURN percentile
+  ELSE:
+    RETURN 50
+
+----------------------------
+DISCORD UI: MANUAL TRIGGER
+----------------------------
+CLASS SignalCheckView extends Discord UI View:
+  ADD button "Run Signal Check"
+    WHEN clicked:
+      reply ephemeral "Checking signals..."
+      CALL run_all_signals()
+
+----------------------------
+STRAT PATTERN DETECTION
+----------------------------
 FUNCTION classify_strat_candle(curr, prev):
-  inside  ← (curr.high ≤ prev.high) AND (curr.low ≥ prev.low)
-  outside ← (curr.high ≥ prev.high) AND (curr.low ≤ prev.low)
-  IF outside AND NOT inside → RETURN "3"
-  IF inside  AND NOT outside → RETURN "1"
-  ELSE
-    IF curr.close > curr.open → RETURN "2u"
-    ELSE                     → RETURN "2d"
+  inside  = (curr.high <= prev.high AND curr.low >= prev.low)
+  outside = (curr.high >= prev.high AND curr.low <= prev.low)
+
+  IF outside and not inside: RETURN "3"
+  ELSE IF inside and not outside: RETURN "1"
+  ELSE:
+    IF curr.close > curr.open: RETURN "2u"
+    ELSE: RETURN "2d"
 
 FUNCTION detect_strat(df):
-  CLEAN df (drop MultiIndex, ensure columns)
-  IF length(df) < 4 → RETURN (None, None)
-  s3 ← classify_strat_candle(df[-3], df[-4])
-  s2 ← classify_strat_candle(df[-2], df[-3])
-  s1 ← classify_strat_candle(df[-1], df[-2])
-  sequence ← [s3, s2, s1]
+  CLEAN df columns (handle MultiIndex)
+  IF df has < 4 candles:
+    RETURN (None, None)
 
-  IF sequence == [3, 1, 2u] → pattern ← "3-1-2 Bullish"
-  IF sequence == [3, 1, 2d] → pattern ← "3-1-2 Bearish"
-  IF sequence in ([2u,1,2u], [2d,1,2u]) → "2-1-2 Bullish"
-  IF sequence in ([2u,1,2d], [2d,1,2d]) → "2-1-2 Bearish"
-  IF sequence == [1, 2u, 2u] → "1-2-2 Bullish"
-  IF sequence == [1, 2d, 2d] → "1-2-2 Bearish"
-  ELSE IF (s3 in {2u,2d} AND s2 == 1):
-        s1 == 2u → "2-1-2 Bullish"
-        s1 == 2d → "2-1-2 Bearish"
+  strat_type_3 = classify candle(-3 vs -4)
+  strat_type_2 = classify candle(-2 vs -3)
+  strat_type_1 = classify candle(-1 vs -2)
+  sequence = [strat_type_3, strat_type_2, strat_type_1]
 
-  RETURN (pattern, sequence)  // pattern may be None
+  MATCH sequence to known STRAT patterns:
+    - 3-1-2 bullish/bearish reversal
+    - 2-1-2 bullish/bearish continuation/reversal
+    - 1-2-2 rev strat bullish/bearish
+    - 2-2 continuation/reversal bullish/bearish variants
+    - 3-2-2 bullish/bearish reversal
 
-FUNCTION render_strat_chart_png(symbol, df, pattern, detected_sequence=None):
-  dff ← last ~26 bars of df
-  ensure dff has columns: Open, High, Low, Close, Volume (floats)
-  create mplfinance candlestick figure (with volume)
-  highlight last 3 bars using translucent spans
-  compute STRAT label for each candle:
-    if detected_sequence present → use for last 3 bars
-    else → compute labels for all
-  draw labels (1, 2u, 2d, 3) above candles
-  save PNG to /tmp/<symbol>_strat.png
-  RETURN file path (or None on error)
-
-ASYNC FUNCTION select_option_contract(symbol, last_price, pattern):
-  tk ← yfinance.Ticker(symbol)
-  expiries ← tk.options
-  IF empty → RETURN (None, None, None)
-  expiry ← nearest expiry
-  direction ← "Call" if "Bullish" in pattern else "Put"
-  df_opt ← calls OR puts from option_chain(expiry)
-  filter df_opt to strikes within [0.5×price, 1.5×price]
-  pick strike closest to last_price
-  RETURN (strike, expiry, direction) OR (fallbacks on error)
-
-ASYNC FUNCTION compute_strat_signal(symbol):
-  df ← yfinance.download(symbol, period="5d", interval="15m")
-  IF df too short → RETURN (None, None, None, None)
-  (pattern, sequence) ← detect_strat(df)
-  IF pattern exists:
-     last_price ← df[-1].Close
-     RETURN (pattern, last_price, df, sequence)
+  IF matched:
+    RETURN (pattern_name, sequence)
   ELSE:
-     RETURN (None, None, df, None)
+    RETURN (None, None)
 
+----------------------------
+CHART RENDERING
+----------------------------
+FUNCTION render_strat_chart_png(symbol, df, pattern, detected_sequence, out_dir, bars):
+  TAKE last N bars
+  CLEAN columns + ensure numeric Open/High/Low/Close/Volume
+  PLOT candlesticks + volume using mplfinance (headless)
+
+  HIGHLIGHT last 3 candles visually
+  LABEL all candles with strat type (use detected_sequence for last 3 if provided)
+
+  SAVE png to disk
+  RETURN filepath OR None if failed
+
+----------------------------
+EXIT TARGETS
+----------------------------
+FUNCTION calculate_exit_prices(df, last_price, pattern):
+  IF df invalid or < 4 candles:
+    RETURN None
+
+  recent = last 20 candles (or fewer)
+  highs = max(recent.high)
+  lows  = min(recent.low)
+  close = last_price
+
+  atr_est = (highs - lows) / number_of_bars * 1.5
+  IF atr_est <= 0:
+    atr_est = close * 0.01
+
+  IF bullish pattern:
+    stop_loss = min(lows, close - atr_est) (logic uses lows if below close)
+    tp1 = highs
+    tp2 = highs + atr_est
+    tp3 = highs + 2*atr_est
+  ELSE bearish:
+    stop_loss = max(highs, close + atr_est)
+    tp1 = lows
+    tp2 = lows - atr_est
+    tp3 = lows - 2*atr_est
+
+  RETURN {stop_loss, tp1, tp2, tp3}
+
+----------------------------
+OPTIONS CONTRACT SELECTION + GREEKS
+----------------------------
+ASYNC FUNCTION select_option_contract(symbol, stock_price, pattern):
+  GET option expirations from yfinance
+  IF none:
+    RETURN all None values
+
+  expiry = first expiry
+  chain = option_chain(expiry)
+  direction = "Call" if bullish else "Put"
+  df_opt = calls or puts
+
+  FILTER strikes within [0.5x stock_price, 1.5x stock_price]
+  IF none:
+    RETURN all None values
+
+  SELECT option with strike closest to stock_price (ATM-ish)
+
+  EXTRACT strike, open interest, volume, bid, ask, last option price, implied vol
+  FIX missing bid/ask by using last price or fallback estimate
+
+  IF iv > 0:
+    COMPUTE time_to_expiry (years)
+    SET risk_free_rate r = 0.05
+    USE Black-Scholes greeks:
+      delta, theta, gamma, vega
+
+  RETURN strike, expiry, direction, oi, opt_volume, bid, ask, iv, delta, theta, gamma, vega
+
+----------------------------
+SIGNAL COMPUTATION (PER SYMBOL)
+----------------------------
+ASYNC FUNCTION compute_strat_signal(symbol):
+  DOWNLOAD 5 days of 15m data in background thread
+  IF not enough data:
+    RETURN (None, None, None, None)
+
+  CLEAN df
+  (pattern, sequence) = detect_strat(df)
+
+  IF pattern found:
+    last_price = last close
+    RETURN (pattern, last_price, df, sequence)
+  ELSE:
+    RETURN (None, None, df, None)
+
+----------------------------
+MAIN SCAN LOOP + ALERTS
+----------------------------
 ASYNC FUNCTION run_all_signals():
-  IF NOT is_market_open() → log "closed" and RETURN
-  FOR each sym in TICKERS:
-    TRY:
-      (pattern, price, df, sequence) ← AWAIT compute_strat_signal(sym)
-      IF pattern:
-        (strike, expiry, opt_type) ← AWAIT select_option_contract(sym, price, pattern)
-        IF any None → set sensible fallbacks (ATM-ish strike, "Next Friday", Call/Put by direction)
-        msg ← formatted Discord text:
-              emoji by direction + pattern + symbol + price + timeframe + option idea + @role
-        channel ← client.get_channel(DISCORD_CHANNEL_ID)
-        IF channel exists:
-           img ← render_strat_chart_png(sym, df, pattern, sequence)
-           IF img exists:
-             send msg with image file
-           ELSE:
-             send msg without image
-    EXCEPT log errors and continue
-  log "Auto-check complete"
+  IF market closed:
+    PRINT "Market closed - skip"
+    RETURN
 
-DISCORD EVENT on_ready():
-  log bot identity
-  send "Bot is online + button" to channel with SignalCheckView()
-  scheduler.start()
-  scheduler.add_job(run_all_signals, every 15 minutes)
-  log "scheduler started"
+  FOR each ticker in TICKERS:
+    (pattern, price, df, sequence) = compute_strat_signal(ticker)
+    IF no pattern:
+      CONTINUE
 
-MAIN:
-  keep_alive()   // tiny Flask server for uptime pings (if needed)
-  client.run(DISCORD_TOKEN)
+    option_data = select_option_contract(ticker, price, pattern)
 
-END
+    market_hour = get_market_hour()
+    ticker_config = get_config(ticker)
+
+    // Minimal “sanity” filters
+    passed = True
+    reasons = []
+
+    IF market_hour outside ticker_config allowed window:
+      passed = False; reasons += ["Market closed window"]
+
+    IF option data incomplete:
+      passed = False; reasons += ["Option data incomplete"]
+
+    // Compute metrics for logging + grading
+    avg_vol = get_average_volume(ticker)
+    current_vol = last candle volume
+    volume_ratio = current_vol / avg_vol if available
+    iv_percentile = calculate_iv_percentile(ticker, iv) else 50
+
+    // Extra context features (not blocking)
+    (volume_spike, vol_ratio) = detect_volume_spike(df)
+    (mtf_status, mtf_detail) = check_multi_timeframe(ticker, pattern)
+    (near_earnings, days) = check_earnings_proximity(ticker)
+    (sector_status, sector_detail) = check_sector_correlation(ticker, pattern)
+
+    exit_prices = calculate_exit_prices(df, price, pattern)
+
+    // Log detection to database
+    detection_id = db.log_pattern_detection(all_metrics + option_data + exit_prices + passed_filters flag)
+
+    IF not passed:
+      PRINT reasons
+      CONTINUE
+
+    // Fib confluence (display-only)
+    fib_info = fibonacci_filters.get_fib_confluence_info(df, price, pattern)
+    fib_display_text = build text if at fib level
+
+    // Grade / confidence score
+    pattern_wr = db.get_pattern_win_rate(pattern)
+    ticker_wr  = db.get_ticker_win_rate(ticker)
+    filter_quality = computed placeholder percent
+    confidence = 0.4*pattern_wr + 0.4*ticker_wr + 0.2*filter_quality
+
+    (grade, emoji) = map confidence to grade bands (A+ ... C+)
+
+    // Build Discord message:
+    - pattern info + price + timeframe
+    - option contract details + greeks + OI/Vol
+    - enhanced info: volume spike, 1H trend, sector correlation, earnings warning
+    - exit targets
+    - role ping
+
+    // Render and send chart if possible
+    channel = Discord channel by DISCORD_CHANNEL_ID
+    chart_path = render_strat_chart_png(...)
+    IF chart exists:
+      SEND message + image file
+    ELSE:
+      SEND message
+
+----------------------------
+OUTCOME TRACKING JOB
+----------------------------
+ASYNC FUNCTION track_outcomes():
+  CONNECT to database
+  SELECT detections older than 4 hours that do not yet have outcomes (limit 20)
+  FOR each detection:
+    DOWNLOAD 5 days of 15m data
+    FIND closest candles to:
+      +15m, +30m, +45m, +1h, +2h, +4h after detection time
+    FOR each target time:
+      RECORD close + intrabar high + intrabar low
+    db.log_outcome(detection_id, all outcome prices, original price, pattern type, exits)
+  PRINT completion
+
+----------------------------
+WEEKLY OPTIMIZATION JOB
+----------------------------
+ASYNC FUNCTION optimize_filters_job():
+  // 1) global optimization from DB historical outcomes
+  (suggestions, msg) = db.optimize_filters()
+  PRINT results
+
+  // 2) per-ticker adaptive thresholds
+  (ticker_configs, msg) = db.optimize_ticker_configs()
+  IF present:
+    SAVE ticker_configs to ticker_config_adaptive.json
+
+  // 3) per-pattern suppression decision (if enabled)
+  (pattern_analysis, msg) = db.optimize_pattern_suppression()
+  IF adaptive suppression enabled:
+    UPDATE suppressed_patterns.json based on low win-rate patterns
+    RELOAD SUPPRESSED_PATTERNS
+
+  // 4) optimize fibonacci filtering rules
+  (changed, msg) = db.optimize_fib_filtering()
+  PRINT results
+
+----------------------------
+DISCORD EVENTS
+----------------------------
+ON client READY:
+  INIT database (db.init_database)
+  SEND "bot online" message with SignalCheckView button
+  START scheduler if not running
+
+  SCHEDULE run_all_signals using cron:
+    - 9:30 & 9:45 (hour 9)
+    - every 15 minutes from 10:00 through 15:45 (hours 10-15)
+  SCHEDULE track_outcomes every 1 hour
+  SCHEDULE optimize_filters_job weekly on Sundays at 8pm ET
+  PRINT list of jobs
+
+ON message RECEIVED:
+  IGNORE messages from bot itself
+
+  IF message == "!test":
+    SEND sample alerts (A+, B, C+) showing format
+
+  IF message == "!stats":
+    GET stats from DB (filter performance + current filter settings)
+    SEND formatted stats message
+
+----------------------------
+PROGRAM ENTRYPOINT
+----------------------------
+FUNCTION main():
+  keep_alive()  // keeps server alive in hosting env
+  RUN Discord client with token
+
+IF __name__ == "__main__":
+  CALL main()
